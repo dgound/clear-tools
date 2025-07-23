@@ -30,7 +30,8 @@ import cli.utils.apa.APAUtils;
 import cli.utils.apa.DistanceBoundCalculator;
 import cli.utils.data.Bounds2DInfo;
 import cli.utils.flags.RegionConfiguration;
-import cli.utils.general.HiCUtils;
+import cli.utils.general.SimpleTranslocationFinder;
+import cli.utils.general.TranslocationSet;
 import javastraw.expected.ExpectedUtils;
 import javastraw.feature2D.Feature2D;
 import javastraw.feature2D.Feature2DList;
@@ -53,7 +54,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class APA3 {
     public static String usage = "apa3 [--ag-norm] [-k NORM] [--window val]" +
-            " [--min-dist val] [--max-dist val] [--include-inter] [-r resolution]" +
+            " [--min-dist val] [--max-dist val] [--include-inter] [-r resolution] [--local-vc]" +
             " <input.hic> <loops1.bedpe> <output1.npy> [<loops2.bedpe> <output2.npy> ...]";
     protected final NormalizationType norm;
     protected final int window;
@@ -66,6 +67,7 @@ public class APA3 {
     private final int minPeakDist; // distance between two bins, can be changed in opts
     private final int maxPeakDist;
     private final boolean includeInterChr;
+    private final boolean useCustomBuiltNorms;
     private final boolean useAgNorm;
     private final int numOutputs;
 
@@ -75,7 +77,6 @@ public class APA3 {
     private final List<double[]> globalRowSums;
     private final List<double[]> globalColSums;
 
-    private final AtomicInteger currChromPair = new AtomicInteger(0);
     private final NormalizationType vcNorm = NormalizationHandler.VC;
     private final Object key = new Object();
     private final HiCZoom zoom;
@@ -126,6 +127,7 @@ public class APA3 {
         minPeakDist = parser.getMinDistVal(2 * window);
         maxPeakDist = parser.getMaxDistVal(Integer.MAX_VALUE);
         includeInterChr = parser.getIncludeInterChromosomal();
+        useCustomBuiltNorms = parser.getBuildCustomVCNorms();
 
         matrixWidthL = 2 * window + 1;
         globalAPAMatrices = initializeMatrices(numOutputs, matrixWidthL);
@@ -164,66 +166,29 @@ public class APA3 {
         System.exit(19);
     }
 
-    public void run() {
-        System.out.println("Processing APA for resolution " + resolution);
-
-        Map<Integer, RegionConfiguration> chromosomePairs = new HashMap<>();
-        int pairCounter = HiCUtils.populateChromosomePairs(chromosomePairs,
-                handler.getChromosomeArrayWithoutAllByAll(), includeInterChr);
-
-        ParallelizationTools.launchParallelizedCode(numThreads, () -> {
-
-            List<float[][]> outputs = initializeMatrices(numOutputs, matrixWidthL);
-            List<double[]> rowSums = initializeArrays(numOutputs, matrixWidthL);
-            List<double[]> colSums = initializeArrays(numOutputs, matrixWidthL);
-
-            int threadPair = currChromPair.getAndIncrement();
-            while (threadPair < pairCounter) {
-                RegionConfiguration config = chromosomePairs.get(threadPair);
-                Chromosome chr1 = config.getChr1();
-                Chromosome chr2 = config.getChr2();
-
-                Matrix matrix = ds.getMatrix(chr1, chr2);
-                if (matrix != null) {
-                    List<List<Feature2D>> loops = getRelevantLoopLists(allLoopLists, chr1.getIndex(), chr2.getIndex());
-                    if (loops != null && loops.size() > 0) {
-                        DistanceBoundCalculator distanceBoundCalculator = new DistanceBoundCalculator(loops, window,
-                                resolution, chr1.getIndex() == chr2.getIndex());
-                        MatrixZoomData zd = matrix.getZoomData(zoom);
-                        if (zd != null) {
-                            try {
-                                processLoopsForRegion(zd, loops, outputs, distanceBoundCalculator);
-                                if (useAgNorm) {
-                                    doAggregateNormalization(chr1, chr2, zoom, vcNorm, loops, rowSums, colSums);
-                                }
-                                System.out.println("Completed " + chr1.getName() + "_" + chr2.getName());
-                            } catch (Exception e) {
-                                System.err.println(e.getMessage());
-                            }
-                        }
+    private static int populateChromosomePairsWithInterFilter(Map<Integer, RegionConfiguration> chromosomePairs,
+                                                              Chromosome[] chromosomes, boolean includeInter,
+                                                              TranslocationSet translocations) {
+        int pairCounter = 0;
+        for (int i = 0; i < chromosomes.length; i++) {
+            if (includeInter) {
+                for (int j = i; j < chromosomes.length; j++) {
+                    if (translocations.contains(chromosomes[i], chromosomes[j])) {
+                        System.out.println("Suspected translocation(s); will skip region " +
+                                chromosomes[i].getName() + " - " + chromosomes[j].getName());
+                        continue;
                     }
-                    matrix.clearCache();
+                    RegionConfiguration config = new RegionConfiguration(chromosomes[i], chromosomes[j]);
+                    chromosomePairs.put(pairCounter, config);
+                    pairCounter++;
                 }
-                threadPair = currChromPair.getAndIncrement();
+            } else {
+                RegionConfiguration config = new RegionConfiguration(chromosomes[i], chromosomes[i]);
+                chromosomePairs.put(pairCounter, config);
+                pairCounter++;
             }
-
-            synchronized (key) {
-                for (int i = 0; i < numOutputs; i++) {
-                    APAUtils.inPlaceSumMatrices(globalAPAMatrices.get(i), outputs.get(i));
-                    if (useAgNorm) {
-                        APAUtils.inPlaceSumVectors(globalRowSums.get(i), rowSums.get(i));
-                        APAUtils.inPlaceSumVectors(globalColSums.get(i), colSums.get(i));
-                    }
-                }
-            }
-        });
-
-        System.out.println("Exporting APA results...");
-        for (int i = 0; i < numOutputs; i++) {
-            APADataExporter.simpleExportGenomeWideData(outputFilePaths[i], useAgNorm, globalAPAMatrices.get(i),
-                    globalRowSums.get(i), globalColSums.get(i));
         }
-        System.out.println("APA complete");
+        return pairCounter;
     }
 
     private List<List<Feature2D>> getRelevantLoopLists(Feature2DList[] allLoopLists, int index1, int index2) {
@@ -243,6 +208,12 @@ public class APA3 {
             vector2 = ds.getNormalizationVector(chr2.getIndex(), zoom, vcNorm).getData().getValues().get(0);
         }
 
+        doAggregateNormalization(cloops, rowSums, colSums, vector1, vector2);
+    }
+
+    private void doAggregateNormalization(List<List<Feature2D>> cloops, List<double[]> rowSums, List<double[]> colSums,
+                                          double[] vector1, double[] vector2) {
+
         for (int i = 0; i < cloops.size(); i++) {
             List<Feature2D> loops = cloops.get(i);
             double[] rowSum = rowSums.get(i);
@@ -258,7 +229,8 @@ public class APA3 {
     }
 
     protected void processLoopsForRegion(MatrixZoomData zd, List<List<Feature2D>> allLoops,
-                                         List<float[][]> outputs, DistanceBoundCalculator distanceBoundCalculator) {
+                                         List<float[][]> outputs, DistanceBoundCalculator distanceBoundCalculator,
+                                         double[] customVCNormVector1, double[] customVCNormVector2) {
         RegionsOfInterest roi = new RegionsOfInterest(resolution, window, matrixWidthL, allLoops);
         int counter = 0;
 
@@ -266,6 +238,8 @@ public class APA3 {
         while (it.hasNext()) {
             ContactRecord cr = it.next();
             if (cr.getCounts() > 0) {
+                customVCNormVector1[cr.getBinX()] += cr.getCounts();
+                customVCNormVector2[cr.getBinY()] += cr.getCounts();
                 if (distanceBoundCalculator.inDistanceRange(cr)) {
                     if (roi.probablyContainsRecord(cr)) {
                         for (int i = 0; i < allLoops.size(); i++) {
@@ -312,5 +286,81 @@ public class APA3 {
         return Feature2DParser.loadFeatures(loopListPath, handler, false,
                 (chr, features) -> APAUtils.filterFeaturesBySize(new ArrayList<>(new HashSet<>(features)),
                         minPeakDist, maxPeakDist, resolution), false);
+    }
+
+    public void run() {
+        System.out.println("Processing APA for resolution " + resolution);
+
+        TranslocationSet translocations = null;
+        if (includeInterChr) {
+            translocations = SimpleTranslocationFinder.find(ds, NormalizationHandler.NONE,
+                    100000);
+        }
+
+        Map<Integer, RegionConfiguration> chromosomePairs = new HashMap<>();
+        int pairCounter = populateChromosomePairsWithInterFilter(chromosomePairs,
+                handler.getChromosomeArrayWithoutAllByAll(), includeInterChr, translocations);
+        final AtomicInteger currChromPair = new AtomicInteger(0);
+
+        ParallelizationTools.launchParallelizedCode(numThreads, () -> {
+
+            List<float[][]> outputs = initializeMatrices(numOutputs, matrixWidthL);
+            List<double[]> rowSums = initializeArrays(numOutputs, matrixWidthL);
+            List<double[]> colSums = initializeArrays(numOutputs, matrixWidthL);
+
+            int threadPair = currChromPair.getAndIncrement();
+            while (threadPair < pairCounter) {
+                RegionConfiguration config = chromosomePairs.get(threadPair);
+                Chromosome chr1 = config.getChr1();
+                Chromosome chr2 = config.getChr2();
+
+                Matrix matrix = ds.getMatrix(chr1, chr2);
+                if (matrix != null) {
+                    List<List<Feature2D>> loops = getRelevantLoopLists(allLoopLists, chr1.getIndex(), chr2.getIndex());
+                    if (!loops.isEmpty()) {
+                        DistanceBoundCalculator distanceBoundCalculator = DistanceBoundCalculator.fromNestedList(loops, window,
+                                resolution, chr1.getIndex() == chr2.getIndex());
+                        MatrixZoomData zd = matrix.getZoomData(zoom);
+                        if (zd != null) {
+                            try {
+                                double[] customVCNormVector1 = new double[(int) (chr1.getLength() / resolution) + 1];
+                                double[] customVCNormVector2 = new double[(int) (chr2.getLength() / resolution) + 1];
+                                processLoopsForRegion(zd, loops, outputs, distanceBoundCalculator,
+                                        customVCNormVector1, customVCNormVector2);
+                                if (useAgNorm) {
+                                    if (useCustomBuiltNorms) {
+                                        doAggregateNormalization(loops, rowSums, colSums, customVCNormVector1, customVCNormVector2);
+                                    } else {
+                                        doAggregateNormalization(chr1, chr2, zoom, vcNorm, loops, rowSums, colSums);
+                                    }
+                                }
+                                System.out.println("Completed " + chr1.getName() + "_" + chr2.getName());
+                            } catch (Exception e) {
+                                System.err.println(e.getMessage());
+                            }
+                        }
+                    }
+                    matrix.clearCache();
+                }
+                threadPair = currChromPair.getAndIncrement();
+            }
+
+            synchronized (key) {
+                for (int i = 0; i < numOutputs; i++) {
+                    APAUtils.inPlaceSumMatrices(globalAPAMatrices.get(i), outputs.get(i));
+                    if (useAgNorm) {
+                        APAUtils.inPlaceSumVectors(globalRowSums.get(i), rowSums.get(i));
+                        APAUtils.inPlaceSumVectors(globalColSums.get(i), colSums.get(i));
+                    }
+                }
+            }
+        });
+
+        System.out.println("Exporting APA results...");
+        for (int i = 0; i < numOutputs; i++) {
+            APADataExporter.simpleExportGenomeWideData(outputFilePaths[i], useAgNorm, globalAPAMatrices.get(i),
+                    globalRowSums.get(i), globalColSums.get(i));
+        }
+        System.out.println("APA complete");
     }
 }
