@@ -225,7 +225,7 @@ public class Grind {
 
             try {
                 SparseContactMatrixWithMasking scm = new SparseContactMatrixWithMasking(zd,
-                        feature2DList, resolution, matrixHalfWidth, matrixWidth, norm);
+                        feature2DList, resolution, matrixHalfWidth, matrixWidth, norm, true);
 
                 AtomicInteger index = new AtomicInteger(0);
 
@@ -401,7 +401,7 @@ public class Grind {
         try {
             int matrixWidth = 2 * matrixHalfWidth + 1;
             SparseContactMatrixWithMasking scm = new SparseContactMatrixWithMasking(zd,
-                    feature2DList, resolution, matrixHalfWidth, matrixWidth, norm);
+                    feature2DList, resolution, matrixHalfWidth, matrixWidth, norm, true);
             
             AtomicInteger index = new AtomicInteger(0);
             
@@ -467,7 +467,7 @@ public class Grind {
         try {
             int matrixWidth = 2 * matrixHalfWidth + 1;
             SparseContactMatrixWithMasking scm = new SparseContactMatrixWithMasking(zd,
-                    feature2DList, resolution, matrixHalfWidth, matrixWidth, norm);
+                    feature2DList, resolution, matrixHalfWidth, matrixWidth, norm, true);
             
             AtomicInteger index = new AtomicInteger(0);
             
@@ -524,14 +524,14 @@ public class Grind {
         try {
             int matrixWidth = 2 * matrixHalfWidth + 1;
             SparseContactMatrixWithMasking scm = new SparseContactMatrixWithMasking(zd,
-                    feature2DList, resolution, matrixHalfWidth, matrixWidth, norm);
+                    feature2DList, resolution, matrixHalfWidth, matrixWidth, norm, true);
             
             // Process in chunks of 100 loops directly to HDF5
             List<LoopData> currentChunk = new ArrayList<>(100);
             
             for (Feature2D loop : feature2DList) {
-                float[][] matrix = new float[matrixWidth][matrixWidth];
-                MultiAPAManager.addToMatrix(matrix, scm, loop, matrixHalfWidth, resolution, matrixWidth);
+                float[][] loopMatrix = new float[matrixWidth][matrixWidth];
+                MultiAPAManager.addToMatrix(loopMatrix, scm, loop, matrixHalfWidth, resolution, matrixWidth);
                 
                 currentChunk.add(new LoopData(
                         loop.getChr1(),
@@ -540,7 +540,7 @@ public class Grind {
                         loop.getChr2(),
                         loop.getStart2(),
                         loop.getEnd2(),
-                        matrix
+                        loopMatrix
                 ));
                 
                 // Write chunk when full
