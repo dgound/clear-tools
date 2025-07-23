@@ -3,11 +3,9 @@ package cli.clt.bedpe;
 import cli.clt.CommandLineParser;
 import cli.utils.apa.MultiAPAManager;
 import cli.utils.data.SparseContactMatrixWithMasking;
-
 import io.jhdf.HdfFile;
 import io.jhdf.WritableHdfFile;
 import io.jhdf.api.WritableGroup;
-
 import javastraw.feature2D.Feature2D;
 import javastraw.feature2D.Feature2DList;
 import javastraw.feature2D.Feature2DParser;
@@ -26,7 +24,6 @@ import java.io.File;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class Grind {
@@ -45,6 +42,7 @@ public class Grind {
     private NormalizationType norm;
     private String stemName;
 
+
     // Lists to store loop information
     private final List<String> chr1List = new ArrayList<>();
     private final List<Long> start1List = new ArrayList<>();
@@ -54,29 +52,6 @@ public class Grind {
     private final List<Long> end2List = new ArrayList<>();
     private final List<Integer> chunkIndexList = new ArrayList<>();
 
-    // Class to store loop data and its matrix
-    private static class LoopData {
-        String chr1;
-        long start1;
-        long end1;
-        String chr2;
-        long start2;
-        long end2;
-        float[][] matrix;
-
-        LoopData(String chr1, long start1, long end1, String chr2, long start2, long end2, float[][] matrix) {
-            this.chr1 = chr1;
-            this.start1 = start1;
-            this.end1 = end1;
-            this.chr2 = chr2;
-            this.start2 = start2;
-            this.end2 = end2;
-            this.matrix = matrix;
-        }
-    }
-
-    // Queue to store loop data
-    private final ConcurrentLinkedQueue<LoopData> loopDataQueue = new ConcurrentLinkedQueue<>();
 
     // Lock object for synchronizing access to loop info lists
     private final Object loopInfoLock = new Object();
@@ -104,12 +79,14 @@ public class Grind {
 
         System.out.println("Using normalization: " + norm.getLabel());
 
+
         matrixHalfWidth = parser.getWindowSizeOption(10);
 
         useNpy = parser.getNpyOption();
 
         zoom = new HiCZoom(resolution);
         handler = ds.getChromosomeHandler();
+
 
         loopList = Feature2DParser.loadFeatures(args[2], handler, false, null, false);
         if (loopList.getNumTotalFeatures() < 1) {
@@ -119,8 +96,9 @@ public class Grind {
         System.out.println("Using stem name: " + stemName);
     }
 
+
     public void run() {
-        if (useNpy) {
+        if (useNpy){
             System.out.println("Using Numpy file type");
             LoopDumper.dump(ds, loopList, outputDirectory, handler, norm,
                     useObservedOverExpected, resolution, matrixHalfWidth);
@@ -128,27 +106,118 @@ public class Grind {
             System.out.println("Using HDF5 file type");
             String resolutionGroupName = String.valueOf(resolution);
 
-            File hdf5File = new File(outputDirectory, stemName + "_loops_at_" + resolutionGroupName + "_bp.hdf5");
+            File hdf5File = new File(outputDirectory, stemName+"_loops_at_"+resolutionGroupName+"_bp.hdf5");
 
             try (WritableHdfFile writableHdfFile = HdfFile.write(Paths.get(hdf5File.getAbsolutePath()))) {
 
                 WritableGroup resolutionGroup = writableHdfFile.putGroup(resolutionGroupName);
+
                 WritableGroup chunksGroup = resolutionGroup.putGroup("chunks");
                 WritableGroup loopInfoGroup = resolutionGroup.putGroup("loop_info");
 
-                // Process all chromosomes and collect loop data
-                processAllChromosomes();
+                AtomicInteger chunkIndex = new AtomicInteger(0);
 
-                // Process the collected loop data and write to HDF5
-                writeLoopDataToHDF5(chunksGroup);
+                List<float[][]> currentChunk = new ArrayList<>(100);
 
-                // Write loop info to HDF5
+                loopList.processLists((chr, feature2DList) -> {
+
+                    System.out.println("Currently on: " + chr);
+
+                    Chromosome chrom = handler.getChromosomeFromName(feature2DList.get(0).getChr1());
+
+                    Matrix matrix = ds.getMatrix(chrom, chrom);
+                    if (matrix == null) return;
+
+                    HiCZoom zoom = ds.getZoomForBPResolution(resolution);
+                    final MatrixZoomData zd = matrix.getZoomData(zoom);
+
+                    if (zd == null) return;
+
+                    int matrixWidth = 2 * matrixHalfWidth + 1;
+
+                    try {
+                        SparseContactMatrixWithMasking scm = new SparseContactMatrixWithMasking(zd,
+                                feature2DList, resolution, matrixHalfWidth, matrixWidth, norm, true); // intra here
+
+                        AtomicInteger index = new AtomicInteger(0);
+
+                        ParallelizationTools.launchParallelizedCode(10, () -> {
+                            int currIndex = index.getAndIncrement();
+
+                            while (currIndex < feature2DList.size()) {
+
+                                Feature2D loop = feature2DList.get(currIndex);
+                                float[][] output = new float[matrixWidth][matrixWidth];
+                                MultiAPAManager.addToMatrix(output, scm, loop, matrixHalfWidth, resolution, matrixWidth);
+
+                                String serializedLoop = loop.toString();
+
+                                String chr1 = loop.getChr1();
+                                long start1 = loop.getStart1();
+                                long end1 = loop.getEnd1();
+                                String chr2 = loop.getChr2();
+                                long start2 = loop.getStart2();
+                                long end2 = loop.getEnd2();
+
+                                int assignedChunkIndex = -1;
+
+                                synchronized (loopInfoLock) {
+                                    currentChunk.add(output);
+                                    if (currentChunk.size() == 100) {
+                                        float[][][] chunkArray = new float[100][matrixWidth][matrixWidth];
+                                        for (int i = 0; i < 100; i++) {
+                                            chunkArray[i] = currentChunk.get(i);
+                                        }
+
+                                        assignedChunkIndex = chunkIndex.getAndIncrement();
+
+                                        String datasetName = "chunk_" + assignedChunkIndex;
+                                        chunksGroup.putDataset(datasetName, chunkArray);
+                                        currentChunk.clear();
+                                    }
+                                }
+
+                                synchronized (loopInfoLock) {
+                                    chr1List.add(chr1);
+                                    start1List.add(start1);
+                                    end1List.add(end1);
+                                    chr2List.add(chr2);
+                                    start2List.add(start2);
+                                    end2List.add(end2);
+                                    assignedChunkIndex = chunkIndex.get() ; // Last assigned chunk
+                                    chunkIndexList.add(assignedChunkIndex);
+                                }
+
+                                currIndex = index.getAndIncrement();
+                            }
+                        });
+
+                    } catch (Exception ex) {
+                        System.err.println("Error processing: " + chr);
+                        ex.printStackTrace();
+                    }
+
+                });
+
+                synchronized (loopInfoLock) {
+                    if (!currentChunk.isEmpty()) {
+                        int remaining = currentChunk.size();
+                        float[][][] chunkArray = new float[remaining][2 * matrixHalfWidth + 1][2 * matrixHalfWidth + 1];
+                        for (int i = 0; i < remaining; i++) {
+                            chunkArray[i] = currentChunk.get(i);
+                        }
+                        String datasetName = "chunk_" + chunkIndex.getAndIncrement();
+                        chunksGroup.putDataset(datasetName, chunkArray);
+                        currentChunk.clear();
+                    }
+                }
+
                 loopInfoGroup.putDataset("chr1", chr1List.toArray(new String[0]));
-                loopInfoGroup.putDataset("start1", start1List.stream().mapToLong(Long::longValue).toArray());
-                loopInfoGroup.putDataset("end1", end1List.stream().mapToLong(Long::longValue).toArray());
+                loopInfoGroup.putDataset("start1", start1List.stream().mapToLong(Long::intValue).toArray());
+                loopInfoGroup.putDataset("end1", end1List.stream().mapToLong(Long::intValue).toArray());
                 loopInfoGroup.putDataset("chr2", chr2List.toArray(new String[0]));
-                loopInfoGroup.putDataset("start2", start2List.stream().mapToLong(Long::longValue).toArray());
-                loopInfoGroup.putDataset("end2", end2List.stream().mapToLong(Long::longValue).toArray());
+                loopInfoGroup.putDataset("start2", start2List.stream().mapToLong(Long::intValue).toArray());
+                loopInfoGroup.putDataset("end2", end2List.stream().mapToLong(Long::intValue).toArray());
                 loopInfoGroup.putDataset("chunk_index", chunkIndexList.stream().mapToInt(Integer::intValue).toArray());
 
                 System.out.println("All loops have been successfully written to " + hdf5File.getAbsolutePath());
@@ -159,109 +228,6 @@ public class Grind {
                 System.exit(4);
             }
         }
-    }
-
-    private void processAllChromosomes() {
-        int matrixWidth = 2 * matrixHalfWidth + 1;
-
-        loopList.processLists((chr, feature2DList) -> {
-            System.out.println("Currently on: " + chr);
-
-            Chromosome chrom = handler.getChromosomeFromName(feature2DList.get(0).getChr1());
-
-            Matrix matrix = ds.getMatrix(chrom, chrom);
-            if (matrix == null) return;
-
-            HiCZoom zoom = ds.getZoomForBPResolution(resolution);
-            final MatrixZoomData zd = matrix.getZoomData(zoom);
-
-            if (zd == null) return;
-
-            try {
-                SparseContactMatrixWithMasking scm = new SparseContactMatrixWithMasking(zd,
-                        feature2DList, resolution, matrixHalfWidth, matrixWidth, norm);
-
-                AtomicInteger index = new AtomicInteger(0);
-
-                ParallelizationTools.launchParallelizedCode(10, () -> {
-                    int currIndex = index.getAndIncrement();
-
-                    while (currIndex < feature2DList.size()) {
-                        Feature2D loop = feature2DList.get(currIndex);
-                        float[][] output = new float[matrixWidth][matrixWidth];
-                        MultiAPAManager.addToMatrix(output, scm, loop, matrixHalfWidth, resolution, matrixWidth);
-
-                        // Add loop data to queue
-                        loopDataQueue.add(new LoopData(
-                                loop.getChr1(),
-                                loop.getStart1(),
-                                loop.getEnd1(),
-                                loop.getChr2(),
-                                loop.getStart2(),
-                                loop.getEnd2(),
-                                output
-                        ));
-
-                        currIndex = index.getAndIncrement();
-                    }
-                });
-
-            } catch (Exception ex) {
-                System.err.println("Error processing: " + chr);
-                ex.printStackTrace();
-            }
-        });
-    }
-
-    private void writeLoopDataToHDF5(WritableGroup chunksGroup) {
-        int matrixWidth = 2 * matrixHalfWidth + 1;
-        AtomicInteger chunkIndex = new AtomicInteger(0);
-        List<LoopData> currentChunk = new ArrayList<>(100);
-
-        // Process all loops from the queue
-        while (!loopDataQueue.isEmpty() || !currentChunk.isEmpty()) {
-            // Fill current chunk up to 100 loops
-            while (currentChunk.size() < 100 && !loopDataQueue.isEmpty()) {
-                LoopData loopData = loopDataQueue.poll();
-                if (loopData != null) {
-                    currentChunk.add(loopData);
-                }
-            }
-
-            // Write chunk if not empty
-            if (!currentChunk.isEmpty()) {
-                int chunkSize = currentChunk.size();
-                float[][][] chunkArray = new float[chunkSize][matrixWidth][matrixWidth];
-
-                // Create the chunk array
-                for (int i = 0; i < chunkSize; i++) {
-                    chunkArray[i] = currentChunk.get(i).matrix;
-                }
-
-                // Write the chunk to HDF5
-                int currentChunkIndex = chunkIndex.getAndIncrement();
-                String datasetName = "chunk_" + currentChunkIndex;
-                chunksGroup.putDataset(datasetName, chunkArray);
-
-                // Add loop info to lists
-                synchronized (loopInfoLock) {
-                    for (LoopData loopData : currentChunk) {
-                        chr1List.add(loopData.chr1);
-                        start1List.add(loopData.start1);
-                        end1List.add(loopData.end1);
-                        chr2List.add(loopData.chr2);
-                        start2List.add(loopData.start2);
-                        end2List.add(loopData.end2);
-                        chunkIndexList.add(currentChunkIndex);
-                    }
-                }
-
-                // Clear the current chunk
-                currentChunk.clear();
-            }
-        }
-
-        System.out.println("Wrote " + chunkIndex.get() + " chunks to HDF5 file");
     }
 
     private String sanitizeStemName(String stemName) {
